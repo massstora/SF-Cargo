@@ -1,0 +1,50 @@
+tick-interval-ms: 100
+max-nodes-per-network: 512
+delete-excess-items: false
+
+coreprotect:
+  enabled: true
+  user: "#sfcargo"
+
+recipes:
+  manager:
+    enabled: true
+    shape:
+      - "RHR"
+      - "DND"
+      - "RCR"
+    ingredients:
+      N: NETHERITE_BLOCK
+      R: REDSTONE_BLOCK
+      H: HOPPER
+      D: DROPPER
+      C: COMPARATOR
+  connector:
+    enabled: true
+    shape:
+      - " G "
+      - "GRG"
+      - " G "
+    ingredients:
+      G: GLASS
+      R: REDSTONE
+  input:
+    enabled: true
+    shape:
+      - " H "
+      - "RCR"
+      - " H "
+    ingredients:
+      H: HOPPER
+      R: REDSTONE
+      C: CHEST
+  output:
+    enabled: true
+    shape:
+      - " D "
+      - "RCR"
+      - " D "
+    ingredients:
+      D: DROPPER
+      R: REDSTONE
+      C: CHEST

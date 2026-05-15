@@ -1,0 +1,18 @@
+name: SF-Cargo
+main: com.massstora.sfcargo.SFCargoPlugin
+version: ${version}
+api-version: "1.21"
+folia-supported: true
+description: Slimefun-style cargo networks with async coordination and Folia-safe inventory work.
+author: massstora
+softdepend:
+  - CoreProtect
+commands:
+  sfcargo:
+    description: SF-Cargo administration command.
+    usage: /sfcargo <give|reload|list|tps>
+    permission: sfcargo.admin
+permissions:
+  sfcargo.admin:
+    description: Allows using SF-Cargo admin commands and bypassing cargo block ownership.
+    default: op
