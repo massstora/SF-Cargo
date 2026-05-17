@@ -1,6 +1,7 @@
 package com.massstora.sfcargo.scheduler;
 
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.plugin.Plugin;
@@ -71,6 +72,41 @@ public final class CargoScheduler {
             future.complete(null);
         }
         return future;
+    }
+
+    public <T> CompletableFuture<T> supplyAtForceLoaded(Location location, RegionSupplier<T> supplier) {
+        if (location == null || location.getWorld() == null || !plugin.isEnabled()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        World world = location.getWorld();
+        int chunkX = location.getBlockX() >> 4;
+        int chunkZ = location.getBlockZ() >> 4;
+        return world.getChunkAtAsync(chunkX, chunkZ, true)
+            .exceptionally(throwable -> null)
+            .thenCompose(chunk -> {
+                if (chunk == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                addTicket(chunk);
+                return supplyAt(location, supplier).whenComplete((ignored, throwable) -> removeTicket(chunk));
+            });
+    }
+
+    private void addTicket(Chunk chunk) {
+        try {
+            chunk.addPluginChunkTicket(plugin);
+        } catch (RuntimeException ex) {
+            plugin.getLogger().log(Level.WARNING, "Could not add temporary SF-Cargo chunk ticket", ex);
+        }
+    }
+
+    private void removeTicket(Chunk chunk) {
+        try {
+            chunk.removePluginChunkTicket(plugin);
+        } catch (RuntimeException ex) {
+            plugin.getLogger().log(Level.WARNING, "Could not remove temporary SF-Cargo chunk ticket", ex);
+        }
     }
 
     @FunctionalInterface

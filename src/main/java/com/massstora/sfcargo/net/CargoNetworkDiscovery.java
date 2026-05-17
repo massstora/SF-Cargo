@@ -27,6 +27,8 @@ public final class CargoNetworkDiscovery {
 
     public CargoNetworkSnapshot discover(CargoBlockRecord manager) {
         CargoNetworkSnapshot snapshot = new CargoNetworkSnapshot(manager, false);
+        List<CargoBlockRecord> managers = new ArrayList<>();
+        managers.add(manager);
         ArrayDeque<BlockKey> queue = new ArrayDeque<>();
         Set<BlockKey> visited = new HashSet<>();
         queue.add(manager.key());
@@ -49,6 +51,7 @@ public final class CargoNetworkDiscovery {
 
             if (record.type() == CargoBlockType.MANAGER && !record.key().equals(manager.key())) {
                 multipleManagers = true;
+                managers.add(record);
                 continue;
             }
 
@@ -65,7 +68,7 @@ public final class CargoNetworkDiscovery {
             discoverNeighbors(current, queue, visited);
         }
 
-        return new CargoNetworkSnapshot(manager, snapshot.inputs(), snapshot.outputs(), multipleManagers, ownerConflict);
+        return new CargoNetworkSnapshot(manager, snapshot.inputs(), snapshot.outputs(), managers, multipleManagers, ownerConflict);
     }
 
     public CargoNetworkSummary summarize(CargoBlockRecord manager) {
@@ -85,11 +88,13 @@ public final class CargoNetworkDiscovery {
             outputs += count;
         }
 
-        return new CargoNetworkSummary(snapshot.inputs().size(), outputs, result.connectors(), result.managers(), result.usedNodes(), maxNodes, snapshot.multipleManagers() || snapshot.ownerConflict(), inputsByChannel, outputsByChannel);
+        return new CargoNetworkSummary(snapshot.inputs().size(), outputs, result.connectors(), result.managers(), result.usedNodes(), maxNodes, snapshot.multipleManagers() || snapshot.ownerConflict(), snapshot.activeManager(), inputsByChannel, outputsByChannel);
     }
 
     private SummaryResult discoverSummary(CargoBlockRecord manager) {
         CargoNetworkSnapshot snapshot = new CargoNetworkSnapshot(manager, false);
+        List<CargoBlockRecord> managerRecords = new ArrayList<>();
+        managerRecords.add(manager);
         ArrayDeque<BlockKey> queue = new ArrayDeque<>();
         Set<BlockKey> visited = new HashSet<>();
         queue.add(manager.key());
@@ -116,6 +121,7 @@ public final class CargoNetworkDiscovery {
                 managers++;
                 if (!record.key().equals(manager.key())) {
                     multipleManagers = true;
+                    managerRecords.add(record);
                     continue;
                 }
             }
@@ -137,7 +143,7 @@ public final class CargoNetworkDiscovery {
             discoverNeighbors(current, queue, visited);
         }
 
-        return new SummaryResult(new CargoNetworkSnapshot(manager, snapshot.inputs(), snapshot.outputs(), multipleManagers, ownerConflict), connectors, managers, visited.size());
+        return new SummaryResult(new CargoNetworkSnapshot(manager, snapshot.inputs(), snapshot.outputs(), managerRecords, multipleManagers, ownerConflict), connectors, managers, visited.size());
     }
 
     public List<CargoBlockRecord> managersConnectedTo(BlockKey target) {

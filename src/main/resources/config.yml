@@ -1,4 +1,5 @@
 tick-interval-ms: 100
+discovery-interval-loops: 10
 max-nodes-per-network: 512
 delete-excess-items: false
 

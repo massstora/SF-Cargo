@@ -27,6 +27,7 @@ public final class CargoTransporter {
     private final boolean deleteExcessItems;
     private final CoreProtectHook coreProtect;
     private final ConcurrentHashMap<BlockKey, Integer> roundRobin = new ConcurrentHashMap<>();
+    private final CargoMoveJournal journal = new CargoMoveJournal();
 
     public CargoTransporter(CargoScheduler scheduler, Logger logger, boolean deleteExcessItems, CoreProtectHook coreProtect) {
         this.scheduler = scheduler;
@@ -63,7 +64,16 @@ public final class CargoTransporter {
                         if (capacity <= 0) {
                             return CompletableFuture.completedFuture(null);
                         }
-                        return scheduler.supplyAt(inputLocation, () -> withdraw(inputLocation, candidate, capacity));
+                        CargoMoveJournal.Move move = journal.planned(input.attachedKey(), candidate.slot(), candidate.stack());
+                        return scheduler.supplyAt(inputLocation, () -> withdraw(inputLocation, candidate, capacity))
+                            .thenApply(withdrawal -> {
+                                if (withdrawal == null) {
+                                    journal.aborted(move);
+                                    return null;
+                                }
+                                journal.withdrawn(move);
+                                return withdrawal.withMove(move);
+                            });
                     });
             })
             .thenCompose(withdrawal -> {
@@ -71,7 +81,7 @@ public final class CargoTransporter {
                     return CompletableFuture.completedFuture(null);
                 }
                 return distribute(input, orderedOutputs, withdrawal.stack())
-                    .thenCompose(leftover -> restoreLeftover(inputLocation, withdrawal.slot(), leftover));
+                    .thenCompose(leftover -> finishMove(withdrawal.move(), inputLocation, withdrawal.slot(), leftover));
             });
     }
 
@@ -128,15 +138,55 @@ public final class CargoTransporter {
         return chain;
     }
 
-    private CompletableFuture<Void> restoreLeftover(Location inputLocation, int slot, ItemStack leftover) {
+    private CompletableFuture<Void> finishMove(CargoMoveJournal.Move move, Location inputLocation, int slot, ItemStack leftover) {
         if (leftover == null || leftover.getAmount() <= 0) {
+            journal.completed(move);
             return CompletableFuture.completedFuture(null);
         }
 
-        return scheduler.supplyAt(inputLocation, () -> {
+        return restoreLeftover(inputLocation, slot, leftover, false).thenAccept(restored -> {
+            if (restored) {
+                journal.completed(move);
+            } else {
+                journal.queueRestore(move, inputLocation, leftover);
+            }
+        });
+    }
+
+    public CompletableFuture<Void> retryPendingRestores() {
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        CargoMoveJournal.RestoreRequest request;
+        while ((request = journal.pollRestore()) != null) {
+            CargoMoveJournal.RestoreRequest current = request;
+            chain = chain.thenCompose(ignored -> restoreLeftover(current.location(), current.slot(), current.item(), true)
+                .thenAccept(restored -> {
+                    if (restored) {
+                        journal.restoreCompleted(current.moveId());
+                    } else {
+                        journal.queueRestore(new CargoMoveJournal.Move(current.moveId(), BlockKey.of(current.location()), current.slot(), current.item(), CargoMoveJournal.MoveState.ROLLBACK_PENDING), current.location(), current.item());
+                    }
+                }));
+        }
+        return chain;
+    }
+
+    public boolean hasJournalBacklog() {
+        return journal.activeMoves() > 0 || journal.pendingRestores() > 0;
+    }
+
+    private CompletableFuture<Boolean> restoreLeftover(Location inputLocation, int slot, ItemStack leftover, boolean forceLoad) {
+        if (leftover == null || leftover.getAmount() <= 0) {
+            return CompletableFuture.completedFuture(true);
+        }
+
+        CompletableFuture<Boolean> restore = (forceLoad ? scheduler.supplyAtForceLoaded(inputLocation, () -> restoreToInventory(inputLocation, slot, leftover)) : scheduler.supplyAt(inputLocation, () -> restoreToInventory(inputLocation, slot, leftover)));
+        return restore.thenApply(restored -> restored != null && restored);
+    }
+
+    private boolean restoreToInventory(Location inputLocation, int slot, ItemStack leftover) {
             Inventory inv = inventoryAt(inputLocation);
             if (inv == null) {
-                return null;
+                return false;
             }
             ItemStack current = inv.getItem(slot);
             coreProtect.logContainerTransaction(inputLocation);
@@ -148,8 +198,23 @@ public final class CargoTransporter {
                     inputLocation.getWorld().dropItemNaturally(inputLocation.clone().add(0.5, 1.0, 0.5), rest);
                 }
             }
-            return null;
-        }).thenApply(ignored -> null);
+            return true;
+    }
+
+    public int activeJournalMoves() {
+        return journal.activeMoves();
+    }
+
+    public int pendingJournalRestores() {
+        return journal.pendingRestores();
+    }
+
+    public long completedJournalMoves() {
+        return journal.completedMoves();
+    }
+
+    public long rollbackQueuedJournalMoves() {
+        return journal.rollbackQueuedMoves();
     }
 
     private Candidate findCandidate(CargoBlockRecord input, Location location) {
@@ -279,6 +344,13 @@ public final class CargoTransporter {
     private record Candidate(int slot, ItemStack stack) {
     }
 
-    private record Withdrawal(int slot, ItemStack stack) {
+    private record Withdrawal(int slot, ItemStack stack, CargoMoveJournal.Move move) {
+        Withdrawal(int slot, ItemStack stack) {
+            this(slot, stack, null);
+        }
+
+        Withdrawal withMove(CargoMoveJournal.Move move) {
+            return new Withdrawal(slot, stack, move);
+        }
     }
 }

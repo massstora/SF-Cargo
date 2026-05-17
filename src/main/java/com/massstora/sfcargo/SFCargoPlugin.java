@@ -55,7 +55,7 @@ public final class SFCargoPlugin extends JavaPlugin {
         CargoScheduler scheduler = new CargoScheduler(this);
         CargoNetworkDiscovery discovery = new CargoNetworkDiscovery(storage, maxNodes);
         CargoTransporter transporter = new CargoTransporter(scheduler, getLogger(), getConfig().getBoolean("delete-excess-items", false), CoreProtectHook.create(this));
-        worker = new CargoWorker(this, storage, discovery, transporter, getConfig().getLong("tick-interval-ms", 100L));
+        worker = new CargoWorker(this, storage, discovery, transporter, getConfig().getLong("tick-interval-ms", 100L), getConfig().getInt("discovery-interval-loops", 10));
         worker.start();
 
         getLogger().info("SF-Cargo enabled using " + (scheduler.folia() ? "Folia region scheduling." : "Paper main-thread scheduling."));
@@ -100,6 +100,9 @@ public final class SFCargoPlugin extends JavaPlugin {
         if (storage != null) {
             storage.save();
         }
+        for (org.bukkit.World world : getServer().getWorlds()) {
+            world.removePluginChunkTickets(this);
+        }
     }
 
     @Override
@@ -130,8 +133,9 @@ public final class SFCargoPlugin extends JavaPlugin {
             sender.sendMessage(ChatColor.GREEN + "SF-Cargo TPS: " + String.format(java.util.Locale.ROOT, "%.0f", worker.pluginTps()) + " / " + worker.expectedLoops());
             sender.sendMessage(ChatColor.GRAY + "Plugin loop time: avg " + String.format(java.util.Locale.ROOT, "%.2f", worker.averagePlanningDurationMs()) + "ms, last " + String.format(java.util.Locale.ROOT, "%.2f", worker.lastPlanningDurationMs()) + "ms");
             sender.sendMessage(ChatColor.GRAY + "Queued inventory moves: " + worker.queuedInventoryMoves());
+            sender.sendMessage(ChatColor.GRAY + "Journal: active " + worker.activeJournalMoves() + ", pending rollback " + worker.pendingJournalRestores() + ", completed " + worker.completedJournalMoves() + ", rollback queued " + worker.rollbackQueuedJournalMoves());
             sender.sendMessage(ChatColor.DARK_GRAY + "Transport wait: avg " + String.format(java.util.Locale.ROOT, "%.2f", worker.averageTransportWaitMs()) + "ms, last " + String.format(java.util.Locale.ROOT, "%.2f", worker.lastTransportWaitMs()) + "ms");
-            sender.sendMessage(ChatColor.GRAY + "Configured interval: " + worker.intervalMs() + "ms");
+            sender.sendMessage(ChatColor.GRAY + "Configured interval: " + worker.intervalMs() + "ms, discovery every " + worker.discoveryIntervalLoops() + " loop(s)");
             sender.sendMessage(ChatColor.GRAY + "Tracked blocks: " + storage.all().size() + ", managers: " + storage.managers().size());
             return true;
         }

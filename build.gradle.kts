@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.massstora"
-version = "0.1.0"
+version = "0.1.1"
 
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"

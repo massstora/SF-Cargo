@@ -123,6 +123,7 @@ public final class CargoMenu implements InventoryHolder {
         setItem(13, item(summary.multipleManagers() ? Material.REDSTONE_BLOCK : Material.EMERALD_BLOCK,
             ChatColor.AQUA + "Network Status",
             summary.multipleManagers() ? ChatColor.RED + "Multiple managers connected" : ChatColor.GREEN + "No manager conflict",
+            summary.multipleManagers() && !summary.activeManager() ? ChatColor.RED + "This newer manager is inactive" : ChatColor.GREEN + "This manager is active",
             ChatColor.GRAY + "Matched channels: " + summary.matchedChannels()));
 
         for (int channel = 0; channel < 16; channel++) {

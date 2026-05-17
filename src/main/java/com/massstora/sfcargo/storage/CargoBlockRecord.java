@@ -12,6 +12,7 @@ public final class CargoBlockRecord {
     private final UUID managerId;
     private final BlockFace attachedFace;
     private final UUID ownerId;
+    private final long createdAtMillis;
     private int channel;
     private boolean roundRobin;
     private boolean smartFill;
@@ -25,11 +26,16 @@ public final class CargoBlockRecord {
     }
 
     public CargoBlockRecord(BlockKey key, CargoBlockType type, UUID managerId, BlockFace attachedFace, UUID ownerId) {
+        this(key, type, managerId, attachedFace, ownerId, System.currentTimeMillis());
+    }
+
+    public CargoBlockRecord(BlockKey key, CargoBlockType type, UUID managerId, BlockFace attachedFace, UUID ownerId, long createdAtMillis) {
         this.key = key;
         this.type = type;
         this.managerId = managerId;
         this.attachedFace = attachedFace;
         this.ownerId = ownerId;
+        this.createdAtMillis = createdAtMillis;
     }
 
     public BlockKey key() {
@@ -46,6 +52,10 @@ public final class CargoBlockRecord {
 
     public UUID ownerId() {
         return ownerId;
+    }
+
+    public long createdAtMillis() {
+        return createdAtMillis;
     }
 
     public BlockFace attachedFace() {

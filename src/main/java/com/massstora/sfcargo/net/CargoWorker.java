@@ -21,9 +21,13 @@ public final class CargoWorker {
     private final CargoNetworkDiscovery discovery;
     private final CargoTransporter transporter;
     private final long intervalMs;
+    private final int discoveryIntervalLoops;
     private final AtomicBoolean planning = new AtomicBoolean();
     private final AtomicBoolean transportInFlight = new AtomicBoolean();
     private ScheduledExecutorService executor;
+    private int loopsUntilDiscovery;
+    private java.util.List<CargoNetworkSnapshot> cachedSnapshots = java.util.List.of();
+    private Map<BlockKey, Integer> cachedEndpointClaims = Map.of();
     private long tickCounter;
     private long queuedInventoryMoves;
     private long transportWaitAccumulatorNs;
@@ -36,12 +40,13 @@ public final class CargoWorker {
     private volatile double lastTransportWaitMs;
     private volatile double lastPlanningDurationMs;
 
-    public CargoWorker(JavaPlugin plugin, CargoStorage storage, CargoNetworkDiscovery discovery, CargoTransporter transporter, long intervalMs) {
+    public CargoWorker(JavaPlugin plugin, CargoStorage storage, CargoNetworkDiscovery discovery, CargoTransporter transporter, long intervalMs, int discoveryIntervalLoops) {
         this.plugin = plugin;
         this.storage = storage;
         this.discovery = discovery;
         this.transporter = transporter;
         this.intervalMs = Math.max(50L, intervalMs);
+        this.discoveryIntervalLoops = Math.max(1, discoveryIntervalLoops);
     }
 
     public void start() {
@@ -72,28 +77,15 @@ public final class CargoWorker {
         long started = System.nanoTime();
         try {
             java.util.ArrayList<CompletableFuture<Void>> futures = new java.util.ArrayList<>();
-            java.util.ArrayList<CargoNetworkSnapshot> snapshots = new java.util.ArrayList<>();
-            Map<BlockKey, Integer> endpointClaims = new HashMap<>();
-            for (CargoBlockRecord manager : storage.managers()) {
-                if (manager.type() != CargoBlockType.MANAGER) {
-                    continue;
-                }
-                CargoNetworkSnapshot snapshot = discovery.discover(manager);
-                snapshots.add(snapshot);
-                for (CargoBlockRecord input : snapshot.inputs()) {
-                    endpointClaims.merge(input.key(), 1, Integer::sum);
-                }
-                for (java.util.List<CargoBlockRecord> outputs : snapshot.outputs().values()) {
-                    for (CargoBlockRecord output : outputs) {
-                        endpointClaims.merge(output.key(), 1, Integer::sum);
-                    }
-                }
-            }
+            NetworkCache networkCache = currentNetworkCache();
 
             if (transportInFlight.compareAndSet(false, true)) {
-                for (CargoNetworkSnapshot snapshot : snapshots) {
-                    if (!snapshot.multipleManagers() && !snapshot.ownerConflict() && !hasSharedEndpoint(snapshot, endpointClaims)) {
-                        futures.add(transporter.route(snapshot));
+                futures.add(transporter.retryPendingRestores());
+                if (!transporter.hasJournalBacklog()) {
+                    for (CargoNetworkSnapshot snapshot : networkCache.snapshots()) {
+                        if (snapshot.activeManager() && !snapshot.ownerConflict() && !hasSharedEndpoint(snapshot, networkCache.endpointClaims())) {
+                            futures.add(transporter.route(snapshot));
+                        }
                     }
                 }
                 long transportStarted = System.nanoTime();
@@ -113,6 +105,41 @@ public final class CargoWorker {
             recordPlanningLoop(System.nanoTime() - started);
             planning.set(false);
         }
+    }
+
+    private NetworkCache currentNetworkCache() {
+        if (loopsUntilDiscovery-- > 0 && !cachedSnapshots.isEmpty()) {
+            return new NetworkCache(cachedSnapshots, cachedEndpointClaims);
+        }
+
+        java.util.ArrayList<CargoNetworkSnapshot> snapshots = new java.util.ArrayList<>();
+        for (CargoBlockRecord manager : storage.managers()) {
+            if (manager.type() != CargoBlockType.MANAGER) {
+                continue;
+            }
+            CargoNetworkSnapshot snapshot = discovery.discover(manager);
+            snapshots.add(snapshot);
+        }
+
+        Map<BlockKey, Integer> endpointClaims = new HashMap<>();
+        for (CargoNetworkSnapshot snapshot : snapshots) {
+            if (!snapshot.activeManager() || snapshot.ownerConflict()) {
+                continue;
+            }
+            for (CargoBlockRecord input : snapshot.inputs()) {
+                endpointClaims.merge(input.key(), 1, Integer::sum);
+            }
+            for (java.util.List<CargoBlockRecord> outputs : snapshot.outputs().values()) {
+                for (CargoBlockRecord output : outputs) {
+                    endpointClaims.merge(output.key(), 1, Integer::sum);
+                }
+            }
+        }
+
+        cachedSnapshots = java.util.List.copyOf(snapshots);
+        cachedEndpointClaims = Map.copyOf(endpointClaims);
+        loopsUntilDiscovery = discoveryIntervalLoops - 1;
+        return new NetworkCache(cachedSnapshots, cachedEndpointClaims);
     }
 
     private void recordPlanningLoop(long planningDurationNs) {
@@ -159,6 +186,10 @@ public final class CargoWorker {
         return intervalMs;
     }
 
+    public int discoveryIntervalLoops() {
+        return discoveryIntervalLoops;
+    }
+
     public double lastTransportWaitMs() {
         return lastTransportWaitMs;
     }
@@ -179,6 +210,22 @@ public final class CargoWorker {
         return lastQueuedInventoryMoves;
     }
 
+    public int activeJournalMoves() {
+        return transporter.activeJournalMoves();
+    }
+
+    public int pendingJournalRestores() {
+        return transporter.pendingJournalRestores();
+    }
+
+    public long completedJournalMoves() {
+        return transporter.completedJournalMoves();
+    }
+
+    public long rollbackQueuedJournalMoves() {
+        return transporter.rollbackQueuedJournalMoves();
+    }
+
     private boolean hasSharedEndpoint(CargoNetworkSnapshot snapshot, Map<BlockKey, Integer> endpointClaims) {
         for (CargoBlockRecord input : snapshot.inputs()) {
             if (endpointClaims.getOrDefault(input.key(), 0) > 1) {
@@ -193,5 +240,8 @@ public final class CargoWorker {
             }
         }
         return false;
+    }
+
+    private record NetworkCache(java.util.List<CargoNetworkSnapshot> snapshots, Map<BlockKey, Integer> endpointClaims) {
     }
 }

@@ -48,7 +48,8 @@ public final class CargoStorage {
                     type,
                     UUID.fromString(section.getString(path + ".manager-id", UUID.randomUUID().toString())),
                     BlockFace.valueOf(section.getString(path + ".attached-face", "SELF")),
-                    parseUuid(section.getString(path + ".owner-id"))
+                    parseUuid(section.getString(path + ".owner-id")),
+                    section.getLong(path + ".created-at", 0L)
                 );
                 record.channel(section.getInt(path + ".channel", 0));
                 record.roundRobin(section.getBoolean(path + ".round-robin", false));
@@ -71,6 +72,7 @@ public final class CargoStorage {
             config.set(path + ".type", record.type().id());
             config.set(path + ".manager-id", record.managerId().toString());
             config.set(path + ".owner-id", record.ownerId() == null ? null : record.ownerId().toString());
+            config.set(path + ".created-at", record.createdAtMillis());
             config.set(path + ".attached-face", record.attachedFace().name());
             config.set(path + ".channel", record.channel());
             config.set(path + ".round-robin", record.roundRobin());
