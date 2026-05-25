@@ -7,7 +7,10 @@ import com.massstora.sfcargo.storage.CargoStorage;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -28,6 +31,7 @@ public final class CargoWorker {
     private int loopsUntilDiscovery;
     private java.util.List<CargoNetworkSnapshot> cachedSnapshots = java.util.List.of();
     private Map<BlockKey, Integer> cachedEndpointClaims = Map.of();
+    private long loopSequence;
     private long tickCounter;
     private long queuedInventoryMoves;
     private long transportWaitAccumulatorNs;
@@ -78,13 +82,14 @@ public final class CargoWorker {
         try {
             java.util.ArrayList<CompletableFuture<Void>> futures = new java.util.ArrayList<>();
             NetworkCache networkCache = currentNetworkCache();
+            boolean rescanCappedChannels = loopSequence++ % discoveryIntervalLoops == 0L;
 
             if (transportInFlight.compareAndSet(false, true)) {
                 futures.add(transporter.retryPendingRestores());
                 if (!transporter.hasJournalBacklog()) {
                     for (CargoNetworkSnapshot snapshot : networkCache.snapshots()) {
                         if (snapshot.activeManager() && !snapshot.ownerConflict() && !hasSharedEndpoint(snapshot, networkCache.endpointClaims())) {
-                            futures.add(transporter.route(snapshot));
+                            futures.add(transporter.route(snapshot, rescanCappedChannels));
                         }
                     }
                 }
@@ -218,12 +223,36 @@ public final class CargoWorker {
         return transporter.pendingJournalRestores();
     }
 
-    public long completedJournalMoves() {
-        return transporter.completedJournalMoves();
+    public int rollbackQueuedJournalMoves() {
+        return transporter.rollbackQueuedJournalMoves();
     }
 
-    public long rollbackQueuedJournalMoves() {
-        return transporter.rollbackQueuedJournalMoves();
+    public List<CargoQueueEntry> queuedMoves(UUID managerId) {
+        return transporter.queuedMoves(managerId);
+    }
+
+    public int queuedMoveCount() {
+        return transporter.queuedMoveCount();
+    }
+
+    public List<CargoQueueCap> queueCaps(UUID managerId) {
+        return transporter.queueCaps(managerId);
+    }
+
+    public boolean hasManagerQueueIssues(UUID managerId) {
+        return !queuedMoves(managerId).isEmpty() || !queueCaps(managerId).isEmpty();
+    }
+
+    public Optional<CargoQueueEntry> queuedMove(UUID managerId, long id) {
+        return transporter.queuedMove(managerId, id);
+    }
+
+    public int purgeQueuedMoves(UUID managerId) {
+        return transporter.purgeQueuedMoves(managerId);
+    }
+
+    public boolean purgeQueuedMove(UUID managerId, long id) {
+        return transporter.purgeQueuedMove(managerId, id);
     }
 
     private boolean hasSharedEndpoint(CargoNetworkSnapshot snapshot, Map<BlockKey, Integer> endpointClaims) {

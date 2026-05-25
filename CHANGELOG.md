@@ -1,6 +1,52 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
+
+### Changed
+
+- Blocked transfer debug queue IDs are now local to each manager.
+  - `/sfcargo manager <uuid> detail <id>` and `purge <id>` already include the manager UUID, so global uniqueness was unnecessary.
+  - IDs still stay in the short `1`-`9999` range and are reused after entries clear.
+
+## 0.1.2
+
+### Added
+
+- Added per-manager blocked transfer debug queues.
+  - `/sfcargo manager <uuid> queued` lists blocked candidate transfers oldest first.
+  - `/sfcargo manager <uuid> detail <id>` shows item, amount, channel, input slot/location, age, and the likely blocked reason.
+  - `/sfcargo manager <uuid> purge` clears all current debug queue entries for a manager.
+  - `/sfcargo manager <uuid> purge <id>` clears one debug queue entry.
+  - Queue IDs are short `1`-`9999` values and can be reused after entries clear.
+  - Blocked input slot scanning is capped per manager/channel by `max-blocked-input-slots-per-manager-channel`.
+  - Capped manager/channels are only rescanned every `discovery-interval-loops` loop(s).
+
+- Added clickable manager UUID copying to `/sfcargo list`.
+  - Player output now includes `[COPY UUID]` next to each manager.
+  - Managers with active queue issues are marked with `☠`.
+
+- Added SQLite block storage.
+  - Tracked cargo blocks now persist to `plugins/SF-Cargo/blocks.db`.
+  - SQLite JDBC is bundled into the plugin jar.
+
+### Changed
+
+- Replaced full YAML block saves with per-record SQLite writes.
+  - Placing and breaking cargo blocks writes only that block record.
+  - Menu edits flush only changed in-memory records.
+
+- Updated `/sfcargo tps` debug output.
+  - Added `Blocked transfer queue entries`.
+  - Renamed old queued inventory pressure to `Deferred transport ticks`.
+  - Removed completed journal tracking because completed moves are not retained in the live journal.
+  - Rollback queue output now reflects current pending rollback work rather than a lifetime counter.
+
+### Migration
+
+- Legacy `plugins/SF-Cargo/blocks.yml` and `plugins/SF-Cargo/blocks.yaml` are imported into `blocks.db` on startup before functional plugin portions are enabled.
+- After successful import, the legacy YAML file is removed so future starts only use SQLite.
+
+## 0.1.1
 
 Compared with the current GitHub baseline at `origin/master` (`8408b28`, initial SF-Cargo plugin commit).
 
@@ -9,7 +55,7 @@ Compared with the current GitHub baseline at `origin/master` (`8408b28`, initial
 - Added an in-memory cargo move journal.
   - Moves are now tracked through planned, withdrawn, restore/insert, and complete states.
   - Failed or partial moves can be queued for rollback during normal runtime.
-  - `/sfcargo tps` now reports journal status: active moves, pending rollbacks, completed moves, and rollback queue count.
+  - `/sfcargo tps` now reports journal status: active moves, pending rollbacks, and rollback queue count.
 
 - Added rollback retry support with temporary chunk tickets.
   - Pending rollback work can temporarily load the needed chunk to finish restoring items.

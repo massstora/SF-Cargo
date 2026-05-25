@@ -1,0 +1,83 @@
+SF-Cargo Features To Add / Scaling Notes
+========================================
+
+1. Per-manager cargo workers
+
+   Current state:
+   - One global CargoWorker discovers every manager, builds every network snapshot, and routes all active managers from one loop.
+   - One global transport-in-flight flag can make unrelated managers wait behind a slow manager.
+   - One global move journal means rollback backlog on one network pauses normal routing everywhere.
+
+   Proposed fix:
+   - Add a small global supervisor that starts/stops lightweight per-manager worker state keyed by manager UUID.
+   - Keep the actual scheduled executor shared; do not create one OS thread per manager.
+   - Give each manager its own discovery cache, transport-in-flight flag, deferred tick counter, move journal, and blocked transfer debug queue.
+   - Keep shared endpoint ownership/claims in a supervisor-level registry so two managers cannot route through the same input/output at the same time.
+
+   Expected benefit:
+   - One stuck, unloaded, or slow manager no longer stalls unrelated cargo networks.
+   - TPS/debug output can become per-manager and much easier to diagnose.
+   - Rollback work becomes localized instead of becoming a global routing pause.
+
+2. Replace repeated full-network discovery with incremental network invalidation
+
+   Current state:
+   - CargoWorker periodically rediscoveres every manager network.
+   - Discovery walks up to max-nodes-per-network for each manager.
+   - Large server cost trends toward managers * maxNodes every discovery refresh, even when nothing changed.
+
+   Proposed fix:
+   - Track a storage/network revision number that increments on cargo block place, break, or owner-affecting/config-affecting edits.
+   - Reuse each manager's cached snapshot until a relevant revision changes.
+   - Longer-term: maintain a block-to-manager/network index so edits only invalidate nearby affected managers rather than every manager.
+
+   Expected benefit:
+   - Idle cargo networks stop paying repeated discovery cost.
+   - Large manager counts scale better when players are not actively rebuilding networks.
+
+3. Add spatial indexing for cargo block lookup during discovery
+
+   Current state:
+   - Neighbor discovery checks six directions and six distances per visited node.
+   - Each check is a map lookup by exact BlockKey, which is cheap, but the number of negative lookups grows with network size and manager count.
+
+   Proposed fix:
+   - Add a per-world/per-axis spatial index of cargo block coordinates.
+   - For each source block, query the next cargo block candidates within the Slimefun cargo range instead of probing every possible offset.
+   - Keep the existing BlockKey map as the authoritative record store.
+
+   Expected benefit:
+   - Fewer empty lookups during discovery.
+   - Better behavior for sparse, large worlds with many cargo networks.
+
+4. Batch or debounce storage flushes from GUI edits
+
+   Current state:
+   - SQLite writes are per-record now, which is much better than rewriting blocks.yml.
+   - Some UI interactions still call storage.save() repeatedly while a player is clicking settings.
+   - save() fingerprints records first, but still scans all tracked blocks to find dirty records.
+
+   Proposed fix:
+   - Add storage.markDirty(record) or storage.update(record) and call it for the specific record changed by the UI.
+   - Optionally debounce GUI saves until inventory close, with an immediate flush on block place/break.
+   - Keep a dirty BlockKey set so save() only considers records known to have changed.
+
+   Expected benefit:
+   - Avoids scanning every tracked block for every menu click.
+   - Keeps SSD writes small and predictable even with very large block counts.
+
+5. Split route planning from region inventory work more explicitly
+
+   Current state:
+   - CargoTransporter chains capacity checks, withdrawal, and insertion through CompletableFuture steps.
+   - Inputs are processed sequentially per network, and outputs are checked sequentially per input.
+   - This is conservative and safe, but a large network with many inputs/outputs can have long transport wait time.
+
+   Proposed fix:
+   - Keep withdrawal/insert operations serialized per inventory, but allow independent inputs on different inventories to progress concurrently with a bounded per-tick budget.
+   - Add a per-manager or global "max inventory ops per tick" setting to avoid overwhelming Paper/Folia schedulers.
+   - Track per-inventory locks/claims so two transfers never mutate the same inventory concurrently.
+
+   Expected benefit:
+   - Large independent networks can move more items without one long sequential chain.
+   - Server owners get a clear tuning knob for throughput versus scheduling pressure.

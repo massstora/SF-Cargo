@@ -10,7 +10,7 @@ softdepend:
 commands:
   sfcargo:
     description: SF-Cargo administration command.
-    usage: /sfcargo <give|reload|list|tps>
+    usage: /sfcargo <give|reload|list|manager|tps>
     permission: sfcargo.admin
 permissions:
   sfcargo.admin:

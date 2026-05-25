@@ -1,6 +1,7 @@
 tick-interval-ms: 100
 discovery-interval-loops: 10
 max-nodes-per-network: 512
+max-blocked-input-slots-per-manager-channel: 520
 delete-excess-items: false
 
 coreprotect:

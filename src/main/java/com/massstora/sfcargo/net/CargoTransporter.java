@@ -15,7 +15,11 @@ import org.bukkit.inventory.ItemStack;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
@@ -26,20 +30,38 @@ public final class CargoTransporter {
     private final Logger logger;
     private final boolean deleteExcessItems;
     private final CoreProtectHook coreProtect;
+    private final int maxBlockedInputSlotsPerManagerChannel;
     private final ConcurrentHashMap<BlockKey, Integer> roundRobin = new ConcurrentHashMap<>();
     private final CargoMoveJournal journal = new CargoMoveJournal();
+    private final ConcurrentHashMap<UUID, ConcurrentHashMap<QueueKey, CargoQueueEntry>> blockedQueue = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, CargoQueueCap>> cappedChannels = new ConcurrentHashMap<>();
 
-    public CargoTransporter(CargoScheduler scheduler, Logger logger, boolean deleteExcessItems, CoreProtectHook coreProtect) {
+    public CargoTransporter(CargoScheduler scheduler, Logger logger, boolean deleteExcessItems, CoreProtectHook coreProtect, int maxBlockedInputSlotsPerManagerChannel) {
         this.scheduler = scheduler;
         this.logger = logger;
         this.deleteExcessItems = deleteExcessItems;
         this.coreProtect = coreProtect;
+        this.maxBlockedInputSlotsPerManagerChannel = Math.max(0, maxBlockedInputSlotsPerManagerChannel);
     }
 
-    public CompletableFuture<Void> route(CargoNetworkSnapshot network) {
+    public CompletableFuture<Void> route(CargoNetworkSnapshot network, boolean rescanCappedChannels) {
         CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        UUID managerId = network.manager().managerId();
+        if (rescanCappedChannels) {
+            cappedChannels.remove(managerId);
+        }
         for (CargoBlockRecord input : network.inputs()) {
-            chain = chain.thenCompose(ignored -> routeInput(input, network.outputsFor(input.channel())));
+            chain = chain.thenCompose(ignored -> {
+                if (blockedChannelFull(managerId, input.channel()) && !rescanCappedChannels) {
+                    markChannelCapped(managerId, input.channel());
+                    return CompletableFuture.completedFuture(null);
+                }
+                if (blockedChannelFull(managerId, input.channel()) && blockedInputCount(managerId, input) == 0) {
+                    markChannelCapped(managerId, input.channel());
+                    return CompletableFuture.completedFuture(null);
+                }
+                return routeInput(managerId, input, network.outputsFor(input.channel()));
+            });
         }
         return chain.exceptionally(throwable -> {
             logger.log(Level.WARNING, "Cargo network tick failed", throwable);
@@ -47,28 +69,46 @@ public final class CargoTransporter {
         });
     }
 
-    private CompletableFuture<Void> routeInput(CargoBlockRecord input, List<CargoBlockRecord> outputs) {
-        if (outputs.isEmpty()) {
+    private CompletableFuture<Void> routeInput(UUID managerId, CargoBlockRecord input, List<CargoBlockRecord> outputs) {
+        Location inputLocation = input.attachedKey().toLocation();
+        CargoQueueEntry.QueueReason inputLocationReason = blockedInputReason(inputLocation);
+        if (inputLocationReason != null) {
+            updateBlockedInput(managerId, input, inputLocationReason, inputLocationReason.display());
             return CompletableFuture.completedFuture(null);
         }
 
-        Location inputLocation = input.attachedKey().toLocation();
         List<CargoBlockRecord> orderedOutputs = orderedOutputs(input, outputs);
-        return scheduler.supplyAt(inputLocation, () -> findCandidate(input, inputLocation))
-            .thenCompose(candidate -> {
+        return scheduler.supplyAt(inputLocation, () -> findCandidates(input, inputLocation, 1))
+            .thenCompose(result -> {
+                if (result == null || !result.reachable()) {
+                    updateBlockedInput(managerId, input, CargoQueueEntry.QueueReason.INPUT_UNREACHABLE, CargoQueueEntry.QueueReason.INPUT_UNREACHABLE.display());
+                    return CompletableFuture.<Withdrawal>completedFuture(null);
+                }
+                Candidate candidate = result.first();
                 if (candidate == null || candidate.stack() == null) {
-                    return CompletableFuture.completedFuture(null);
+                    clearBlockedInput(managerId, input);
+                    return CompletableFuture.<Withdrawal>completedFuture(null);
+                }
+                if (outputs.isEmpty()) {
+                    return recordBlockedCandidates(managerId, input, inputLocation, CargoQueueEntry.QueueReason.NO_OUTPUTS, "No output is connected on channel " + input.channel() + ".")
+                        .thenApply(ignored -> null);
                 }
                 return availableCapacity(orderedOutputs, candidate.stack(), input.smartFill())
                     .thenCompose(capacity -> {
                         if (capacity <= 0) {
-                            return CompletableFuture.completedFuture(null);
+                            return diagnoseOutputs(orderedOutputs, candidate.stack(), input.smartFill())
+                                .thenCompose(reason -> recordBlockedCandidates(managerId, input, inputLocation, reason.reason(), reason.detail())
+                                .thenApply(ignored -> {
+                                    return null;
+                                }));
                         }
+                        clearBlocked(managerId, input, candidate);
                         CargoMoveJournal.Move move = journal.planned(input.attachedKey(), candidate.slot(), candidate.stack());
                         return scheduler.supplyAt(inputLocation, () -> withdraw(inputLocation, candidate, capacity))
                             .thenApply(withdrawal -> {
                                 if (withdrawal == null) {
                                     journal.aborted(move);
+                                    recordBlocked(managerId, input, candidate, CargoQueueEntry.QueueReason.INPUT_UNREACHABLE, "The input inventory changed before withdrawal.");
                                     return null;
                                 }
                                 journal.withdrawn(move);
@@ -209,26 +249,86 @@ public final class CargoTransporter {
         return journal.pendingRestores();
     }
 
-    public long completedJournalMoves() {
-        return journal.completedMoves();
+    public int rollbackQueuedJournalMoves() {
+        return journal.pendingRestores();
     }
 
-    public long rollbackQueuedJournalMoves() {
-        return journal.rollbackQueuedMoves();
+    public List<CargoQueueEntry> queuedMoves(UUID managerId) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return List.of();
+        }
+        return managerQueue.values().stream()
+            .sorted(Comparator.comparingLong(CargoQueueEntry::queuedAtMillis).thenComparingLong(CargoQueueEntry::id))
+            .toList();
     }
 
-    private Candidate findCandidate(CargoBlockRecord input, Location location) {
+    public int queuedMoveCount() {
+        int total = 0;
+        for (ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue : blockedQueue.values()) {
+            total += managerQueue.size();
+        }
+        return total;
+    }
+
+    public List<CargoQueueCap> queueCaps(UUID managerId) {
+        ConcurrentHashMap<Integer, CargoQueueCap> managerCaps = cappedChannels.get(managerId);
+        if (managerCaps == null) {
+            return List.of();
+        }
+        return managerCaps.values().stream()
+            .sorted(Comparator.comparingInt(CargoQueueCap::channel))
+            .toList();
+    }
+
+    public Optional<CargoQueueEntry> queuedMove(UUID managerId, long id) {
+        return queuedMoves(managerId).stream()
+            .filter(entry -> entry.id() == id)
+            .findFirst();
+    }
+
+    public int purgeQueuedMoves(UUID managerId) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> removed = blockedQueue.remove(managerId);
+        cappedChannels.remove(managerId);
+        return removed == null ? 0 : removed.size();
+    }
+
+    public boolean purgeQueuedMove(UUID managerId, long id) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return false;
+        }
+
+        for (Map.Entry<QueueKey, CargoQueueEntry> entry : managerQueue.entrySet()) {
+            if (entry.getValue().id() == id) {
+                int channel = entry.getValue().channel();
+                boolean removed = managerQueue.remove(entry.getKey(), entry.getValue());
+                if (managerQueue.isEmpty()) {
+                    blockedQueue.remove(managerId, managerQueue);
+                }
+                clearCapIfBelowLimit(managerId, channel);
+                return removed;
+            }
+        }
+        return false;
+    }
+
+    private CandidateSearch findCandidates(CargoBlockRecord input, Location location, int limit) {
         Inventory inv = inventoryAt(location);
         if (inv == null) {
-            return null;
+            return new CandidateSearch(List.of(), false);
         }
+        ArrayList<Candidate> candidates = new ArrayList<>();
         for (int slot = 0; slot < inv.getSize(); slot++) {
             ItemStack stack = inv.getItem(slot);
             if (CargoFilter.matches(input, stack)) {
-                return new Candidate(slot, stack.clone());
+                candidates.add(new Candidate(slot, stack.clone()));
+                if (candidates.size() >= limit) {
+                    break;
+                }
             }
         }
-        return null;
+        return new CandidateSearch(candidates, true);
     }
 
     private Withdrawal withdraw(Location location, Candidate candidate, int requestedAmount) {
@@ -341,7 +441,250 @@ public final class CargoTransporter {
         return null;
     }
 
+    private CargoQueueEntry.QueueReason blockedInputReason(Location location) {
+        if (location == null || location.getWorld() == null) {
+            return CargoQueueEntry.QueueReason.INPUT_UNLOADED;
+        }
+        if (!location.getWorld().isChunkLoaded(location.getBlockX() >> 4, location.getBlockZ() >> 4)) {
+            return CargoQueueEntry.QueueReason.INPUT_UNLOADED;
+        }
+        return null;
+    }
+
+    private CargoQueueEntry.QueueReason blockedOutputReason(Location location) {
+        if (location == null || location.getWorld() == null) {
+            return CargoQueueEntry.QueueReason.OUTPUT_UNLOADED;
+        }
+        if (!location.getWorld().isChunkLoaded(location.getBlockX() >> 4, location.getBlockZ() >> 4)) {
+            return CargoQueueEntry.QueueReason.OUTPUT_UNLOADED;
+        }
+        return null;
+    }
+
+    private CompletableFuture<OutputDiagnosis> diagnoseOutputs(List<CargoBlockRecord> outputs, ItemStack stack, boolean smartFill) {
+        CompletableFuture<OutputDiagnosis> chain = CompletableFuture.completedFuture(
+            new OutputDiagnosis(CargoQueueEntry.QueueReason.OUTPUT_NO_SPACE, "All reachable outputs on this channel are full or cannot accept the item.")
+        );
+
+        for (CargoBlockRecord output : outputs) {
+            chain = chain.thenCompose(current -> {
+                if (current.reason() == CargoQueueEntry.QueueReason.OUTPUT_UNLOADED) {
+                    return CompletableFuture.completedFuture(current);
+                }
+
+                Location outputLocation = output.attachedKey().toLocation();
+                CargoQueueEntry.QueueReason locationReason = blockedOutputReason(outputLocation);
+                if (locationReason != null) {
+                    return CompletableFuture.completedFuture(new OutputDiagnosis(locationReason, locationReason.display() + " at " + output.attachedKey() + "."));
+                }
+
+                return scheduler.supplyAt(outputLocation, () -> outputStatus(outputLocation, stack, smartFill))
+                    .thenApply(status -> chooseOutputDiagnosis(current, status, output));
+            });
+        }
+
+        return chain;
+    }
+
+    private OutputDiagnosis chooseOutputDiagnosis(OutputDiagnosis current, OutputDiagnosis candidate, CargoBlockRecord output) {
+        if (candidate == null) {
+            return current;
+        }
+        if (candidate.reason() == CargoQueueEntry.QueueReason.OUTPUT_UNREACHABLE) {
+            candidate = new OutputDiagnosis(candidate.reason(), candidate.detail() + " at " + output.attachedKey() + ".");
+        }
+        if (severity(candidate.reason()) > severity(current.reason())) {
+            return candidate;
+        }
+        return current;
+    }
+
+    private int severity(CargoQueueEntry.QueueReason reason) {
+        return switch (reason) {
+            case OUTPUT_UNLOADED -> 3;
+            case OUTPUT_UNREACHABLE -> 2;
+            case OUTPUT_NO_SPACE -> 1;
+            default -> 0;
+        };
+    }
+
+    private OutputDiagnosis outputStatus(Location location, ItemStack stack, boolean smartFill) {
+        Inventory inv = outputInventoryAt(location);
+        if (inv == null || !canInsert(inv, stack)) {
+            return new OutputDiagnosis(CargoQueueEntry.QueueReason.OUTPUT_UNREACHABLE, CargoQueueEntry.QueueReason.OUTPUT_UNREACHABLE.display());
+        }
+        return capacityAt(location, stack, smartFill) <= 0
+            ? new OutputDiagnosis(CargoQueueEntry.QueueReason.OUTPUT_NO_SPACE, "All reachable outputs on this channel are full or cannot accept the item.")
+            : null;
+    }
+
+    private CompletableFuture<Void> recordBlockedCandidates(UUID managerId, CargoBlockRecord input, Location inputLocation, CargoQueueEntry.QueueReason reason, String detail) {
+        int candidateLimit = blockedCandidateLimit(managerId, input);
+        return scheduler.supplyAt(inputLocation, () -> findCandidates(input, inputLocation, candidateLimit))
+            .thenAccept(result -> {
+                if (result == null || !result.reachable()) {
+                    updateBlockedInput(managerId, input, CargoQueueEntry.QueueReason.INPUT_UNREACHABLE, CargoQueueEntry.QueueReason.INPUT_UNREACHABLE.display());
+                    return;
+                }
+                recordBlocked(managerId, input, result.candidates(), reason, detail);
+                reconcileBlockedInput(managerId, input, result.candidates());
+            });
+    }
+
+    private void recordBlocked(UUID managerId, CargoBlockRecord input, List<Candidate> candidates, CargoQueueEntry.QueueReason reason, String detail) {
+        for (Candidate candidate : candidates) {
+            recordBlocked(managerId, input, candidate, reason, detail);
+        }
+    }
+
+    private void recordBlocked(UUID managerId, CargoBlockRecord input, Candidate candidate, CargoQueueEntry.QueueReason reason, String detail) {
+        QueueKey key = new QueueKey(input.key(), input.attachedKey(), candidate.slot(), input.channel(), candidate.stack().getType().name());
+        blockedQueue.computeIfAbsent(managerId, ignored -> new ConcurrentHashMap<>())
+            .compute(key, (ignored, current) -> {
+                if (current == null) {
+                    int id = nextManagerQueueId(managerId);
+                    if (id <= 0) {
+                        markChannelCapped(managerId, input.channel());
+                        return null;
+                    }
+                    return new CargoQueueEntry(id, managerId, input.attachedKey(), candidate.slot(), input.channel(), candidate.stack(), System.currentTimeMillis(), System.currentTimeMillis(), reason, detail);
+                }
+                return current.withUpdate(candidate.stack(), reason, detail);
+            });
+    }
+
+    private int nextManagerQueueId(UUID managerId) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null || managerQueue.isEmpty()) {
+            return 1;
+        }
+
+        boolean[] used = new boolean[10_000];
+        for (CargoQueueEntry entry : managerQueue.values()) {
+            if (entry.id() > 0 && entry.id() < used.length) {
+                used[(int) entry.id()] = true;
+            }
+        }
+        for (int id = 1; id < used.length; id++) {
+            if (!used[id]) {
+                return id;
+            }
+        }
+        return -1;
+    }
+
+    private int blockedCandidateLimit(UUID managerId, CargoBlockRecord input) {
+        if (maxBlockedInputSlotsPerManagerChannel <= 0) {
+            return Integer.MAX_VALUE;
+        }
+        int existingInput = blockedInputCount(managerId, input);
+        int remainingChannel = Math.max(1, maxBlockedInputSlotsPerManagerChannel - blockedChannelCount(managerId, input.channel()));
+        return existingInput + remainingChannel;
+    }
+
+    private boolean blockedChannelFull(UUID managerId, int channel) {
+        return maxBlockedInputSlotsPerManagerChannel > 0 && blockedChannelCount(managerId, channel) >= maxBlockedInputSlotsPerManagerChannel;
+    }
+
+    private int blockedChannelCount(UUID managerId, int channel) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return 0;
+        }
+        int count = 0;
+        for (CargoQueueEntry entry : managerQueue.values()) {
+            if (entry.channel() == channel) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private int blockedInputCount(UUID managerId, CargoBlockRecord input) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return 0;
+        }
+        int count = 0;
+        for (QueueKey key : managerQueue.keySet()) {
+            if (key.inputBlock().equals(input.key())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private void markChannelCapped(UUID managerId, int channel) {
+        int count = blockedChannelCount(managerId, channel);
+        cappedChannels.computeIfAbsent(managerId, ignored -> new ConcurrentHashMap<>())
+            .put(channel, new CargoQueueCap(managerId, channel, count, maxBlockedInputSlotsPerManagerChannel));
+    }
+
+    private void clearCapIfBelowLimit(UUID managerId, int channel) {
+        if (!blockedChannelFull(managerId, channel)) {
+            ConcurrentHashMap<Integer, CargoQueueCap> managerCaps = cappedChannels.get(managerId);
+            if (managerCaps != null) {
+                managerCaps.remove(channel);
+                if (managerCaps.isEmpty()) {
+                    cappedChannels.remove(managerId, managerCaps);
+                }
+            }
+        }
+    }
+
+    private void updateBlockedInput(UUID managerId, CargoBlockRecord input, CargoQueueEntry.QueueReason reason, String detail) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return;
+        }
+        managerQueue.replaceAll((key, entry) -> key.inputBlock().equals(input.key()) ? entry.withUpdate(entry.item(), reason, detail) : entry);
+    }
+
+    private void clearBlocked(UUID managerId, CargoBlockRecord input, Candidate candidate) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return;
+        }
+        managerQueue.remove(new QueueKey(input.key(), input.attachedKey(), candidate.slot(), input.channel(), candidate.stack().getType().name()));
+        if (managerQueue.isEmpty()) {
+            blockedQueue.remove(managerId, managerQueue);
+        }
+    }
+
+    private void reconcileBlockedInput(UUID managerId, CargoBlockRecord input, List<Candidate> candidates) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return;
+        }
+        java.util.HashSet<QueueKey> currentKeys = new java.util.HashSet<>();
+        for (Candidate candidate : candidates) {
+            currentKeys.add(new QueueKey(input.key(), input.attachedKey(), candidate.slot(), input.channel(), candidate.stack().getType().name()));
+        }
+        managerQueue.entrySet().removeIf(entry -> entry.getKey().inputBlock().equals(input.key()) && !currentKeys.contains(entry.getKey()));
+        if (managerQueue.isEmpty()) {
+            blockedQueue.remove(managerId, managerQueue);
+        }
+        clearCapIfBelowLimit(managerId, input.channel());
+    }
+
+    private void clearBlockedInput(UUID managerId, CargoBlockRecord input) {
+        ConcurrentHashMap<QueueKey, CargoQueueEntry> managerQueue = blockedQueue.get(managerId);
+        if (managerQueue == null) {
+            return;
+        }
+        managerQueue.entrySet().removeIf(entry -> entry.getKey().inputBlock().equals(input.key()));
+        if (managerQueue.isEmpty()) {
+            blockedQueue.remove(managerId, managerQueue);
+        }
+    }
+
     private record Candidate(int slot, ItemStack stack) {
+    }
+
+    private record CandidateSearch(List<Candidate> candidates, boolean reachable) {
+        Candidate first() {
+            return candidates.isEmpty() ? null : candidates.get(0);
+        }
     }
 
     private record Withdrawal(int slot, ItemStack stack, CargoMoveJournal.Move move) {
@@ -352,5 +695,11 @@ public final class CargoTransporter {
         Withdrawal withMove(CargoMoveJournal.Move move) {
             return new Withdrawal(slot, stack, move);
         }
+    }
+
+    private record QueueKey(BlockKey inputBlock, BlockKey inventoryBlock, int slot, int channel, String itemType) {
+    }
+
+    private record OutputDiagnosis(CargoQueueEntry.QueueReason reason, String detail) {
     }
 }

@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.massstora"
-version = "0.1.1"
+version = "0.1.3"
 
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
@@ -19,4 +19,15 @@ tasks.processResources {
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    implementation("org.xerial:sqlite-jdbc:3.46.1.0")
+}
+
+tasks.jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+    from({
+        configurations.runtimeClasspath.get()
+            .filter { it.name.endsWith(".jar") }
+            .map { zipTree(it) }
+    })
 }
